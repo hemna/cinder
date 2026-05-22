@@ -49,6 +49,7 @@ class BaseVolumeTestCase(test.TestCase):
         self.flags(volumes_dir=vol_tmpdir)
         self.addCleanup(self._cleanup)
         self.volume = importutils.import_object(CONF.volume_manager)
+        self.addCleanup(self._cleanup_threadpool)
         self.mock_object(self.volume, '_driver_shares_targets',
                          return_value=False)
         self.volume.message_api = mock.Mock()
@@ -87,6 +88,17 @@ class BaseVolumeTestCase(test.TestCase):
             shutil.rmtree(CONF.volumes_dir)
         except OSError:
             pass
+
+    def _cleanup_threadpool(self):
+        """Shut down the manager's ThreadPoolExecutor to prevent worker hang.
+
+        ThreadPoolExecutor creates non-daemon threads (Python 3.9+) that
+        block process exit. In stestr, tests run in worker subprocesses
+        that must exit cleanly after all tests complete. Without explicit
+        shutdown, idle executor threads keep the worker alive indefinitely.
+        """
+        if hasattr(self.volume, '_tp'):
+            self.volume._tp.shutdown(wait=False, cancel_futures=True)
 
     def fake_get_all_volume_groups(obj, vg_name=None, no_suffix=True):
         return [{'name': 'cinder-volumes',

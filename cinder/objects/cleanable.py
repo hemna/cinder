@@ -17,6 +17,7 @@ import collections.abc as collections
 import inspect
 
 import decorator
+import eventlet
 from oslo_utils import versionutils
 
 from cinder import db
@@ -199,14 +200,44 @@ class CinderCleanableObject(base.CinderPersistentObject):
                 cleanables = [cand for cand in candidates
                               if (isinstance(cand, CinderCleanableObject)
                                   and cand.is_cleanable(pinned=False))]
+                hb = None
+                stop_heartbeat = eventlet.event.Event()
                 try:
                     # Create the entries in the workers table
                     for cleanable in cleanables:
                         cleanable.set_worker()
 
+                    # Spawn a greenthread that periodically touches worker
+                    # entries to keep them fresh. This prevents a new pod's
+                    # init_host -> _do_cleanup from resetting resources that
+                    # are actively being processed during graceful shutdown.
+                    def _worker_heartbeat():
+                        while not stop_heartbeat.ready():
+                            for cleanable in cleanables:
+                                if cleanable.worker:
+                                    try:
+                                        db.worker_update(
+                                            cleanable._context,
+                                            cleanable.worker.id)
+                                    except Exception:
+                                        pass
+                            # Sleep up to 10s but wake immediately when
+                            # stop_heartbeat fires (avoids blocking the
+                            # calling greenthread for up to 10s on shutdown).
+                            try:
+                                with eventlet.Timeout(10):
+                                    stop_heartbeat.wait()
+                            except eventlet.Timeout:
+                                pass
+                    hb = eventlet.spawn(_worker_heartbeat)
+
                     # Call the function
                     result = f(*args, **kwargs)
                 finally:
+                    # Stop the heartbeat greenthread
+                    stop_heartbeat.send()
+                    if hb is not None:
+                        hb.wait()
                     # Remove entries from the workers table
                     for cleanable in cleanables:
                         # NOTE(geguileo): We check that the status has changed

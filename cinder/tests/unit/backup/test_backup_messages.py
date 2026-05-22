@@ -556,8 +556,10 @@ class BackupUserMessagesTest(test.TestCase):
         mock_detach.side_effect = exception.InvalidBackup(
             reason="test reason")
 
-        self.assertRaises(
-            exception.InvalidBackup, manager.restore_backup,
+        # _detach_device errors are now caught and logged (not re-raised)
+        # during restore cleanup to avoid masking the restore result.
+        # The restore itself succeeds, so no exception propagates.
+        manager.restore_backup(
             fake_context, fake_backup, fake.VOLUME_ID, False)
         self.assertEqual(message_field.Action.BACKUP_RESTORE,
                          fake_context.message_action)

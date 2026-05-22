@@ -51,11 +51,12 @@ This module provides Manager, a base class for managers.
 
 """
 
+from concurrent import futures
+import threading
+from typing import Callable
 from typing import Optional
 
-from eventlet import greenpool
 from eventlet import tpool
-import futurist
 from oslo_config import cfg
 import oslo_config.types
 from oslo_log import log as logging
@@ -67,7 +68,6 @@ from cinder import context
 from cinder import db
 from cinder.db import base
 from cinder import exception
-from cinder import monkey_patch
 from cinder import objects
 from cinder import rpc
 from cinder.scheduler import rpcapi as scheduler_rpcapi
@@ -103,9 +103,6 @@ class Manager(base.Base, PeriodicTasks):
         super().__init__()
 
     def _set_tpool_size(self, nthreads: int) -> None:
-        if not monkey_patch.is_patched():
-            return
-
         # NOTE(geguileo): Until PR #472 is merged we have to be very careful
         # not to call "tpool.execute" before calling this method.
         tpool.set_num_threads(nthreads)
@@ -168,22 +165,92 @@ class Manager(base.Base, PeriodicTasks):
 
 
 class ThreadPoolManager(Manager):
-    def __init__(self, *args, **kwargs):
-        self._tp: Optional[greenpool.GreenPool] = None
+    """Manager class that provides a managed thread pool.
 
+    Tasks spawned via _add_to_threadpool() will be waited on during
+    graceful shutdown, ensuring in-flight operations complete before
+    the service terminates.
+
+    This implementation uses native Python threads via ThreadPoolExecutor
+    instead of eventlet green threads, as eventlet is being deprecated
+    and will be removed in a future OpenStack release.
+    """
+
+    # Maximum number of worker threads for async operations
+    # This replaces the eventlet GreenPool which had unlimited concurrency
+    DEFAULT_THREADPOOL_SIZE = 10
+
+    def __init__(self, *args, **kwargs):
+        # Use native Python ThreadPoolExecutor instead of eventlet GreenPool
+        # This provides real OS threads and proper shutdown semantics
+        pool_size = CONF.threadpool_size or self.DEFAULT_THREADPOOL_SIZE
+        self._tp = futures.ThreadPoolExecutor(
+            max_workers=pool_size,
+            thread_name_prefix="cinder-volume-worker"
+        )
+        self._shutdown_event = threading.Event()
+        LOG.info("Initialized ThreadPoolExecutor with %d workers", pool_size)
         super(ThreadPoolManager, self).__init__(*args, **kwargs)
 
-        if monkey_patch.is_patched():
-            self._tp = greenpool.GreenPool()
+    def _add_to_threadpool(self, func: Callable, *args,
+                           **kwargs) -> Optional[futures.Future]:
+        """Spawn a task in the threadpool.
 
-    def _add_to_threadpool(self, func, *args, **kwargs) -> None:
-        if not monkey_patch.is_patched():
-            raise AssertionError(
-                "ThreadPoolManager is only for eventlet mode.")
+        Tasks spawned here will be waited on during graceful shutdown.
+        Uses native Python threads via ThreadPoolExecutor.
 
-        assert self._tp is not None
-        self._tp.spawn_n(func, *args, **kwargs)
-        return
+        :param func: The function to execute
+        :param args: Positional arguments to pass to the function
+        :param kwargs: Keyword arguments to pass to the function
+        :returns: A Future object representing the task, or None if shutdown
+                  has been signaled
+        """
+        if self._shutdown_event.is_set():
+            LOG.warning(
+                "Rejecting threadpool task during shutdown: %s",
+                func.__name__)
+            return None
+
+        return self._tp.submit(func, *args, **kwargs)
+
+    def signal_shutdown(self) -> None:
+        """Signal that shutdown is in progress.
+
+        After this is called, new tasks submitted via _add_to_threadpool()
+        will be rejected. Existing tasks will continue to run.
+        """
+        LOG.info("Shutdown signaled, rejecting new threadpool tasks")
+        self._shutdown_event.set()
+
+    def cleanup_threadpool(self) -> None:
+        """Cleanup the threadpool executor and prepare for potential restart.
+
+        Should be called during service shutdown after pool.waitall() has
+        drained in-flight RPC handlers. This ensures the executor is
+        properly shut down and all resources are released.
+
+        After cleanup, a fresh executor is created so the manager is ready
+        for reuse if the service is restarted (e.g., oslo.service
+        ProcessLauncher with restart_method='mutate' will fork a new child
+        that inherits this object and calls start() again).
+        """
+        LOG.info("Shutting down threadpool executor")
+        # wait=True ensures all pending tasks complete before returning
+        # cancel_futures=False allows in-flight tasks to finish
+        self._tp.shutdown(wait=True, cancel_futures=False)
+        LOG.info("Threadpool executor shutdown complete")
+
+        # Re-create the executor and reset shutdown state so the manager
+        # is ready if the service is restarted. Without this, a restarted
+        # child process would hit "cannot schedule new futures after
+        # shutdown" when init_host() calls _add_to_threadpool().
+        pool_size = CONF.threadpool_size or self.DEFAULT_THREADPOOL_SIZE
+        self._tp = futures.ThreadPoolExecutor(
+            max_workers=pool_size,
+            thread_name_prefix="cinder-volume-worker",
+        )
+        self._shutdown_event.clear()
+        LOG.info("Threadpool executor re-initialized for potential restart")
 
 
 class SchedulerDependentManager(ThreadPoolManager):
@@ -243,24 +310,6 @@ class SchedulerDependentManager(ThreadPoolManager):
         self.scheduler_rpcapi = scheduler_rpcapi.SchedulerAPI()
 
 
-class SizedThreadPoolManager(SchedulerDependentManager):
-    def __init__(self, *args, **kwargs):
-        self._tpe: Optional[futurist.GreenPoolExecutor |
-                            futurist.ThreadPoolExecutor] = None
-
-        super(SizedThreadPoolManager, self).__init__(*args, **kwargs)
-
-    def _init_pool(self, max_workers):
-        if monkey_patch.is_patched():
-            self._tpe = futurist.GreenThreadPoolExecutor(max_workers)
-        else:
-            self._tpe = futurist.ThreadPoolExecutor(max_workers)
-
-    def _add_to_threadpool(self, func, *args, **kwargs) -> None:
-        assert self._tpe is not None
-        self._tpe.submit(func, *args, **kwargs)
-
-
 class CleanableManager(object):
     def do_cleanup(self,
                    context: context.RequestContext,
@@ -281,6 +330,20 @@ class CleanableManager(object):
             until=until)
 
         for clean in to_clean:
+            # Skip worker entries that are being actively heartbeated by a
+            # DIFFERENT service. During graceful shutdown / rolling updates,
+            # the set_workers decorator keeps touching updated_at every 10s.
+            # If the entry is fresh (< service_down_time) AND belongs to a
+            # different service than us, the operation is still in progress
+            # on the draining pod. Don't reset it.
+            # When we're cleaning our OWN service's entries (e.g., normal
+            # init_host cleanup after a crash), always proceed.
+            if clean.service_id != self.service_id:
+                age = (timeutils.utcnow() -
+                       clean.updated_at).total_seconds()
+                if age < CONF.service_down_time:
+                    continue
+
             original_service_id = clean.service_id
             original_time = clean.updated_at
             # Try to do a soft delete to mark the entry as being cleaned up
